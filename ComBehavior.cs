@@ -1,48 +1,34 @@
-﻿using AI3;
+using AI3.StateMachine;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.AI;
 
 namespace AI3.StateMachine
 {
-    /// <summary>
-    /// Combat AI: Combat Area range-band behavior
-    /// No cover-seeking yet (none exists)
-    ///
-    /// Deliberately no HoldDecay() call: AICore.UpdateAlertness() already pins AIAlertness.level at
-    /// High for up to AI_TIME_MAX_ALERT while in contact, independent of Pulse's capacitor discharge.
-    /// Losing the target (LOS gone long enough) is handled entirely by AIStateManager's normal
-    /// alertness-driven transition into Agitated -- this class doesn't watch for that itself.
-    ///
-    /// IMPORTANT: movement here is root-motion-driven (AIAnimator sets Animator.applyRootMotion = true
-    /// and NavMeshAgent.updatePosition = false), meaning the character physically translates in
-    /// whatever direction the currently-playing clip moves it -- forward, relative to its own facing,
-    /// for the WALK/RUN clips that exist today (no backward/strafe clips are defined). That means
-    /// facing MUST track movement direction while actually relocating, or any locomotion clip will
-    /// drag the character toward wherever it's facing regardless of the NavMeshAgent's own path.
-    /// Facing is therefore only overridden to point at the target while stationary (Preferred zone,
-    /// holding position to shoot); while approaching, movement-direction-facing already points
-    /// roughly at the target anyway
-    ///
-    /// Ranged combat only for now: if the AI isn't holding a Gun, Tick() is a no-op. No AI-specific
-    /// aim error yet either -- shots aim exactly at the tracked target position, with only the
-    /// weapon's own WeaponInfo.maxSpread (shared with the player) adding inaccuracy. Also no
-    /// deliberate burst/pause pacing -- fires every tick the gun is idle and conditions allow, so a
-    /// weapon's own fireRateRPM/magazineSize entirely determine how "controlled" it looks (a 10-round
-    /// mag at 600rpm empties in ~1s, non-stop). Add pacing here later if that's not the intended feel.
-    /// </summary>
-    public class HostileBehavior : AIStateBehavior
+    public class CombatBehavior : AIStateBehavior
     {
-        private enum Zone { BelowMinimum, DeadZoneNear, Preferred, DeadZoneFar, BeyondMaximum }
+        private enum Zone {  BelowMinimum, DeadZoneNear, Preferred, DeadZoneFar, BeyondMaximum }
+        private enum MovementIntent {  None, PursueLastKnown, ApproachRange, RetreatToRange, LateralReposition}
 
-        private const float SUPPRESSIVE_FIRE_CHANCE = 0.15f; // flat per-Tick() chance while BeyondMaximum, not framerate-normalized
-        private const float REPOSITION_INTERVAL = 0.5f;      // throttle for non-urgent repositioning (everything except BelowMinimum)
-        private const int RETREAT_SAMPLE_ATTEMPTS = 5;        // candidate angles to try if the direct-away point isn't on the NavMesh
-        private const float APPROACH_STOP_MARGIN = 0.5f;     // small cushion against root-motion/blend lag so approach doesn't nudge past the edge of Preferred
+        private const float SUPPRESSIVE_FIRE_CHANCE = 0.15f;
+        private const float SUPPRESSIVE_DECISION_INTERVAL = 0.75f;
+        private const float REPOSITION_INTERVAL = 0.5f;
+        private const int POSITION_SAMPLE_ATTEMPTS = 7;
+        private const float POSITION_ANGLE_STEP = 25f;
+        private const float RANGE_INSIDE_MARGIN = 0.5f;
+        private const int MIN_SHOTS_BEFORE_REPOSITION = 2;
+        private const int MAX_SHOTS_BEFORE_REPOSITION = 5;
 
         private bool _prevUpdateRotation;
         private float _prevStoppingDistance;
-        private bool _facingOverrideActive; // true only while stationary in Preferred, manually facing the target
+        private readonly NavMeshPath _candidatePath = new NavMeshPath();
+        private bool _facingOverrideActive;
+        private MovementIntent _movementIntent;
+        private Vector3 _moveDestination;
         private float _repositionTimer;
+        private float _nextSupressiveDecision;
+        private int _shotsFromCurrentPosition;
+        private int _shotsBeforeReposition;
         private GameObject _targetObject;
         private Vector3 _targetPosition;
 
@@ -52,13 +38,17 @@ namespace AI3.StateMachine
             {
                 _prevUpdateRotation = Core.NavMeshAgent.updateRotation;
                 _prevStoppingDistance = Core.NavMeshAgent.stoppingDistance;
+                Core.NavMeshAgent.updateRotation = true;
             }
 
-            _facingOverrideActive = false; // start out following movement direction, like every other state
+            _facingOverrideActive = false; // start out folling movement direction, like every other state
+            _movementIntent = MovementIntent.None;
             _repositionTimer = 0f;
+            _nextSupressiveDecision = 0f;
+            ResetPositionShotBudget();
             RefreshTarget();
 
-            // TODO: draw weapon / combat-entry bark and animation.
+            // TODO -> combat-entry bark
         }
 
         public override void Tick()
@@ -68,24 +58,34 @@ namespace AI3.StateMachine
             if (_targetObject == null)
                 return; // shouldn't normally happen while Hostile, but nothing to fight if it does
 
-            if (_facingOverrideActive)
-                FaceTarget(); // only while stationary -- see class-level note on root motion
-
             if (!(Core.AIEquipManager.CurrentWeapon is Gun gun))
                 return; // melee/no-weapon combat not implemented yet
 
             float distance = HorizontalDistance(Core.transform.position, _targetPosition);
             Zone zone = ClassifyZone(gun.info, distance);
 
-            HandleMovement(zone, gun.info);
-            HandleFiring(zone, gun);
+            bool isRelocating = HandleMovement(zone, gun.info);
+            if (!isRelocating)
+                FaceTarget();
+
+            HandleFiring(zone, gun, isRelocating);
         }
 
-        public override void Exit(AIState next) => RestoreAgent();
-        public override void OnDeath() => RestoreAgent();
+        public override void Exit(AIState next)
+        {
+            RestoreAgent();
+        }
+
+        public override void OnDeath()
+        {
+            RestoreAgent();
+        }
 
         private void RestoreAgent()
         {
+            _movementIntent = MovementIntent.None;
+            _facingOverrideActive = false;
+
             if (Core.NavMeshAgent == null)
                 return;
 
@@ -140,55 +140,111 @@ namespace AI3.StateMachine
             return Zone.BeyondMaximum;
         }
 
-        private void HandleMovement(Zone zone, WeaponInfo info)
+        private bool HandleMovement(Zone zone, WeaponInfo info)
         {
             if (Core.NavMeshAgent == null || !Core.NavMeshAgent.isOnNavMesh)
-                return;
+                return false;
 
             _repositionTimer -= Time.deltaTime;
 
+            
+            // Range is evaluated before an existing path is allowed to continue. Approach, retreat, and pursuit are goals, not uninterruptible animations:
+            // as soon as the live target position putsus in a different band, the obsolete path must be replaced or stopped.
             if (!HasLineOfSight())
             {
-                SetFacingOverride(false); // Let the AI face where it's walking
-                if (_repositionTimer <= 0f)
+                CancelMovementExcept(MovementIntent.PursueLastKnown);
+
+                if (_movementIntent != MovementIntent.PursueLastKnown || _repositionTimer <= 0f)
                 {
-                    // Approach the exact last known location with a minimal stopping distance
-                    ApproachTo(0f);
+                    BeginApproach(0f, MovementIntent.PursueLastKnown);
                     _repositionTimer = REPOSITION_INTERVAL;
                 }
-                return; // Skip the standard zone switch statement below
+                return ContinueMovement(MovementIntent.PursueLastKnown);
             }
-
-            SetFacingOverride(true);
 
             switch (zone)
             {
                 case Zone.BelowMinimum:
-                    RetreatFrom(info.preferredRangeMin);
-                    _repositionTimer = 0f;
-                    break;
-
                 case Zone.DeadZoneNear:
-                    if (_repositionTimer <= 0f)
+                    CancelMovementExcept(MovementIntent.RetreatToRange);
+                    if (_movementIntent != MovementIntent.RetreatToRange || _repositionTimer <= 0f)
                     {
-                        RetreatFrom(info.preferredRangeMin);
+                        FindFiringPosition(info, true);
                         _repositionTimer = REPOSITION_INTERVAL;
                     }
-                    break;
+                    return ContinueMovement(MovementIntent.RetreatToRange);
 
                 case Zone.Preferred:
-                    Core.NavMeshAgent.ResetPath();
+                    // The transform-to-target distaince is authoritative. NavMeshAgent.remaninigDistance
+                    // can lag when updatePosition is false and root motion drives the actual transform.
+                    float liveDistance = HorizontalDistance(Core.transform.position, _targetPosition);
+                    float innerPreferred = Mathf.Min(
+                        info.preferredRangeMax,
+                        info.preferredRangeMin + RANGE_INSIDE_MARGIN);
+                    float outerPreferred = Mathf.Max(
+                        info.preferredRangeMin,
+                        info.preferredRangeMax - RANGE_INSIDE_MARGIN);
+
+                    // Continue just inside the band before stopping. Without this hysteresis, animation
+                    // coast or a moving target can alternate adjacent frames across a range boundary.
+                    if (_movementIntent == MovementIntent.ApproachRange && liveDistance > outerPreferred)
+                        return ContinueMovement(MovementIntent.ApproachRange);
+                    if (_movementIntent == MovementIntent.RetreatToRange && liveDistance < innerPreferred)
+                        return ContinueMovement(MovementIntent.RetreatToRange);
+
+                    CancelMovementExcept(MovementIntent.LateralReposition);
+                    if (_movementIntent == MovementIntent.LateralReposition)
+                    {
+                        if (ContinueMovement(MovementIntent.LateralReposition))
+                            return true;
+                    }
+                    
+                    if (_shotsFromCurrentPosition >= _shotsBeforeReposition && _repositionTimer <= 0f)
+                    {
+                        FindFiringPosition(info, false);
+                        _repositionTimer = REPOSITION_INTERVAL;
+                    }
                     break;
 
                 case Zone.DeadZoneFar:
                 case Zone.BeyondMaximum:
-                    if (_repositionTimer <= 0f)
+                    CancelMovementExcept(MovementIntent.ApproachRange);
+                    if (_movementIntent != MovementIntent.ApproachRange || _repositionTimer <= 0f)
                     {
-                        ApproachTo(info.preferredRangeMax);
+                        BeginApproach(info.preferredRangeMax, MovementIntent.ApproachRange);
                         _repositionTimer = REPOSITION_INTERVAL;
                     }
-                    break;
+                    return ContinueMovement(MovementIntent.ApproachRange);
             }
+
+            if (_movementIntent != MovementIntent.None)
+                return true;
+
+            HoldFiringPosition();
+            return false;
+        }
+
+        private void CancelMovementExcept(MovementIntent allowedIntent)
+        {
+            if (_movementIntent == MovementIntent.None || _movementIntent == allowedIntent)
+                return;
+
+            StopMovement(false);
+        }
+
+        private bool ContinueMovement(MovementIntent expectedIntent)
+        {
+            if (_movementIntent != expectedIntent)
+                return false;
+
+            if (ReachedDestination())
+            {
+                StopMovement(true);
+                return false;
+            }
+
+            SetFacingOverride(false);
+            return true;
         }
 
         /// <summary>Toggles NavMeshAgent.updateRotation to match: manual facing (FaceTarget) only while
@@ -204,70 +260,156 @@ namespace AI3.StateMachine
         }
 
         /// <summary>
-        /// Hands the real target position straight to NavMeshAgent and lets its own pathfinding route
-        /// around corners/walls -- this is what fixes "doesn't move at all" when the target is out of
-        /// sight around a corner. stoppingDistance controls how close the agent actually gets, with a
-        /// small extra margin as cheap insurance against root-motion/animation-blend lag overshooting
-        /// the exact boundary.
+        /// Hands the target pos to NMA so normal pathfinding can route around walls.
+        /// The margin is subtracted: adding it would stop just outside the preferred band and cause
+        /// repeated DeadZoneFar approach results.
         /// </summary>
-        private void ApproachTo(float targetDistance)
+        /// <param name="targetDistance"></param>
+        /// <param name="intent"></param>
+        private void BeginApproach(float targetDistance, MovementIntent intent)
         {
-            Core.NavMeshAgent.stoppingDistance = targetDistance + APPROACH_STOP_MARGIN;
-            Core.NavMeshAgent.SetDestination(_targetPosition);
+            SetFacingOverride(false);
+            Core.NavMeshAgent.stoppingDistance = Mathf.Max(0f, targetDistance - RANGE_INSIDE_MARGIN);
+            Vector3 nextDestination = _targetPosition;
+            if (Core.NavMeshAgent.SetDestination(nextDestination))
+            {
+                _moveDestination = nextDestination;
+                _movementIntent = intent;
+            }
+            else if (_movementIntent != intent)
+            {
+                _movementIntent = MovementIntent.None;
+            }
         }
 
         /// <summary>
-        /// Retreating has no NavMeshAgent-native primitive (stoppingDistance only helps when
-        /// approaching a destination), so this still needs an explicit fallback point -- but tries
-        /// several candidate angles around "directly away" rather than one single point, so a nearby
-        /// wall/corner doesn't just silently fail to produce any destination at all.
+        /// Try radial, lateral, and fallback moves around its target. A near retreat first tries directly awawy;
+        /// a normal re-eval starts laterally. Only complete paths are accepted. SamplePosition alone does not
+        /// prove the AI can reach the point.
         /// </summary>
-        private void RetreatFrom(float targetDistance)
+        /// <param name="info"></param>
+        /// <param name="retreat"></param>
+        private void FindFiringPosition(WeaponInfo info, bool retreat)
         {
             Vector3 flatSelf = Core.transform.position; flatSelf.y = 0f;
             Vector3 flatTarget = _targetPosition; flatTarget.y = 0f;
 
-            Vector3 awayDir = flatSelf - flatTarget;
-            awayDir = awayDir.sqrMagnitude > 0.0001f ? awayDir.normalized : Core.transform.forward;
+            Vector3 radial = flatSelf - flatTarget;
+            radial = radial.sqrMagnitude > 0.0001f ? radial.normalized : Core.transform.forward;
+            float minRange = info.preferredRangeMin + RANGE_INSIDE_MARGIN;
+            float maxRange = Mathf.Max(minRange, info.preferredRangeMax - RANGE_INSIDE_MARGIN);
+            float desiredRange = retreat
+                ? minRange
+                : Mathf.Clamp(HorizontalDistance(flatSelf, flatTarget), minRange, maxRange);
+            int firstSide = Random.value < 0.5f ? -1 : 1;
 
-            for (int i = 0; i < RETREAT_SAMPLE_ATTEMPTS; i++)
+            for (int i = 0; i < POSITION_SAMPLE_ATTEMPTS; i++)
             {
-                float angle = i == 0 ? 0f : (i % 2 == 1 ? 1 : -1) * (i * 25f);
-                Vector3 candidateDir = Quaternion.Euler(0f, angle, 0f) * awayDir;
-                Vector3 candidate = flatTarget + candidateDir * targetDistance;
+                int magnitude = retreat ? (i + 1) / 2 : i / 2 + 1;
+                int side = i % 2 == 0 ? firstSide : -firstSide;
+                float angle = retreat && i == 0 ? 0f : side * magnitude * POSITION_ANGLE_STEP;
+                Vector3 candidateDir = Quaternion.Euler(0f, angle, 0f) * radial;
+                Vector3 candidate = flatTarget + candidateDir * desiredRange;
                 candidate.y = Core.transform.position.y;
 
-                if (NavMesh.SamplePosition(candidate, out NavMeshHit hit, targetDistance, NavMesh.AllAreas))
-                {
-                    Core.NavMeshAgent.SetDestination(hit.position);
+                if (Vector3.SqrMagnitude(Flatten(candidate - Core.transform.position)) < 1f)
+                    continue;
+
+                if (NavMesh.SamplePosition(candidate, out NavMeshHit hit, 2f, Core.NavMeshAgent.areaMask) &&
+                    TryBeginPath(hit.position, retreat ? MovementIntent.RetreatToRange : MovementIntent.LateralReposition))
                     return;
-                }
             }
 
-            // Boxed in on all tried angles -- hold position and keep firing rather than get stuck
-            // mid-computation with a stale or nonexistent destination.
-            Core.NavMeshAgent.ResetPath();
+            // A refresh may fail transiently near a NavMesh edge. Preserve an existing path of the
+            // same intent rather than dropping into stationary firing while the agent still moves.
         }
 
-        private void HandleFiring(Zone zone, Gun gun)
+        private static Vector3 Flatten(Vector3 value)
         {
-            if (!HasLineOfSight())
+            value.y = 0f;
+            return value;
+        }
+
+        private bool TryBeginPath(Vector3 destination, MovementIntent intent)
+        {
+            if (!Core.NavMeshAgent.CalculatePath(destination, _candidatePath) ||
+                _candidatePath.status != NavMeshPathStatus.PathComplete)
+                return false;
+
+            SetFacingOverride(false);
+            Core.NavMeshAgent.stoppingDistance = 0.15f;
+            if (!Core.NavMeshAgent.SetPath(_candidatePath))
+                return false;
+
+            _moveDestination = destination;
+            _movementIntent = intent;
+            return true;
+        }
+
+        private bool ReachedDestination()
+        {
+            // Root motion owns the transform, so use physical pos first. stoppingDistance is intentionally large for approach paths and tiny for sampled firing positions
+            float arrivalRadius = Core.NavMeshAgent.stoppingDistance + 0.25f;
+            if (HorizontalDistance(Core.transform.position, _moveDestination) <= arrivalRadius)
+                return true;
+
+            if (Core.NavMeshAgent.pathPending)
+                return false;
+
+            return !Core.NavMeshAgent.hasPath ||
+                Core.NavMeshAgent.pathStatus == NavMeshPathStatus.PathInvalid;
+        }
+
+        private void StopMovement(bool completedPositionChange)
+        {
+            _movementIntent = MovementIntent.None;
+            if (Core.NavMeshAgent != null && Core.NavMeshAgent.isOnNavMesh && Core.NavMeshAgent.hasPath)
+                Core.NavMeshAgent.ResetPath();
+            if (completedPositionChange)
+                ResetPositionShotBudget();
+        }
+
+        private void HoldFiringPosition()
+        {
+            _movementIntent = MovementIntent.None;
+            if (Core.NavMeshAgent.hasPath)
+                Core.NavMeshAgent.ResetPath();
+            SetFacingOverride(true);
+        }
+
+        private void ResetPositionShotBudget()
+        {
+            _shotsFromCurrentPosition = 0;
+            _shotsBeforeReposition = Random.Range(
+                MIN_SHOTS_BEFORE_REPOSITION,
+                MAX_SHOTS_BEFORE_REPOSITION + 1);
+        }
+
+        private void HandleFiring(Zone zone, Gun gun, bool isRelocating)
+        {
+            if (isRelocating || !HasLineOfSight())
                 return;
 
-            // Retreating means facing follows movement direction (away from the target) now, not the
-            // target itself -- see class-level note. No coherent way to fire while facing away without
-            // a dedicated backward/strafe animation, so this deliberately drops the doc's "still fires
-            // while backing away" detail until those assets exist.
             if (zone == Zone.BelowMinimum)
                 return;
 
             if (gun.CurrentState != EquippableObject.EquipState.Idle)
                 return;
 
-            if (zone == Zone.BeyondMaximum && Random.value > SUPPRESSIVE_FIRE_CHANCE)
-                return; // "only fire sporadically with suppressive fire... may not attack at all"
+            if (zone == Zone.BeyondMaximum)
+            {
+                if (Time.time < _nextSupressiveDecision)
+                    return;
+
+                _nextSupressiveDecision = Time.time + SUPPRESSIVE_DECISION_INTERVAL;
+                if (Random.value > SUPPRESSIVE_FIRE_CHANCE)
+                    return;
+            }
 
             Core.AIEquipManager.FireAtTarget(_targetPosition);
+            _shotsFromCurrentPosition++;
+            if (_shotsFromCurrentPosition >= _shotsBeforeReposition)
+                _repositionTimer = 0f;
         }
     }
 }
