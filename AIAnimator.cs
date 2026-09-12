@@ -1,4 +1,4 @@
-﻿using AI3.Model;
+using AI3.Model;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -224,8 +224,6 @@ namespace AI3
             CancelPendingOnExit(layer);
 
             _currentAnimation[layer] = animation;
-            if (animation != Animations.H1_IDLE_LOWEST && animation != Animations.H1_WALK_LOWEST && animation != Animations.H1_COMBAT_MOVEMENT)
-                Debug.Log("findme -> Playing anim for " + gameObject.name + ", anim = " + animation.ToString() + ", layer = " + layer + ", locklayer? " + lockLayer + ", bypassLock? " + bypassLock + ", crossfade = " + crossfade + ", PRIORITY = " + priority);
             Animator.CrossFade(Animator.StringToHash(_currentAnimation[layer].ToString()), crossfade, layer);
         }
 
@@ -347,16 +345,21 @@ namespace AI3
             Animations blendState = weapon == "H2" ? Animations.H2_COMBAT_MOVEMENT : Animations.H1_COMBAT_MOVEMENT;
             Play(blendState, layer, false, false);
 
+            // Animator params are controller-wide, not layer-specific. Both layers enter the combat movement state,
+            // but writing the same damped values twice per frame changes the damping repsonse and does unnecessary work.
+            // Let lowerbody own the param updates
+            if (layer != LOWERBODY)
+                return;
+
             float maxSpeed = Mathf.Max(_aiCore.NavMeshAgent.speed, 0.01f);
             float moveX = Mathf.Clamp(Velocity.x / maxSpeed, -1f, 1f);
             float moveY = Mathf.Clamp(Velocity.y / maxSpeed, -1f, 1f);
 
             if (float.IsNaN(moveX))
-                Debug.Log("-----------------------------FINDME FINDME FINDME -> NaN for MoveX. Velocity.x = " + Velocity.x + ", maxSpeed = " + maxSpeed + ", divided = " + (Velocity.x / maxSpeed));
+                moveX = 0f;
             if (float.IsNaN(moveY))
-                Debug.Log("-----------------------------FINDME FINDME FINDME -> NaN for MoveX. Velocity.x = " + Velocity.y + ", maxSpeed = " + maxSpeed + ", divided = " + (Velocity.x / maxSpeed));
+                moveY = 0f;
 
-            Debug.Log("FINDME -> setting layer " + (layer == 0 ? "UPPERBODY" : "LOWERBODY") + ": MoveX = " + moveX + ", MoveY = " + moveY);
             Animator.SetFloat(PARAM_MOVE_X, moveX, MOVE_BLEND_DAMP_TIME, Time.deltaTime);
             Animator.SetFloat(PARAM_MOVE_Y, moveY, MOVE_BLEND_DAMP_TIME, Time.deltaTime);
         }
