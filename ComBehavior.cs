@@ -1,5 +1,7 @@
 using AI3.StateMachine;
+using NUnit.Framework.Constraints;
 using System.Collections;
+using Unity.VisualScripting;
 using UnityEngine;
 using UnityEngine.AI;
 
@@ -7,8 +9,8 @@ namespace AI3.StateMachine
 {
     public class CombatBehavior : AIStateBehavior
     {
-        private enum Zone {  BelowMinimum, DeadZoneNear, Preferred, DeadZoneFar, BeyondMaximum }
-        private enum MovementIntent {  None, PursueLastKnown, ApproachRange, RetreatToRange, LateralReposition}
+        private enum Zone { BelowMinimum, DeadZoneNear, Preferred, DeadZoneFar, BeyondMaximum }
+        private enum MovementIntent { None, PursueLastKnown, ApproachRange, RetreatToRange, LateralReposition }
 
         private const float SUPPRESSIVE_FIRE_CHANCE = 0.15f;
         private const float SUPPRESSIVE_DECISION_INTERVAL = 0.75f;
@@ -16,6 +18,10 @@ namespace AI3.StateMachine
         private const int POSITION_SAMPLE_ATTEMPTS = 7;
         private const float POSITION_ANGLE_STEP = 25f;
         private const float RANGE_INSIDE_MARGIN = 0.5f;
+        private const float TARGET_REPLAN_DISTANCE = 1f;
+        private const float TACTICAL_MOVE_DURATION = 0.6f;
+        private const float COMBAT_TURN_SPEED = 360f;
+        private const float FIRE_ALIGNMENT_ANGLE = 15f;
         private const int MIN_SHOTS_BEFORE_REPOSITION = 2;
         private const int MAX_SHOTS_BEFORE_REPOSITION = 5;
 
@@ -25,12 +31,14 @@ namespace AI3.StateMachine
         private bool _facingOverrideActive;
         private MovementIntent _movementIntent;
         private Vector3 _moveDestination;
+        private Vector3 _targetPositionAtPlan;
         private float _repositionTimer;
-        private float _nextSupressiveDecision;
+        private float _nextSuppressiveDecision;
         private int _shotsFromCurrentPosition;
         private int _shotsBeforeReposition;
         private GameObject _targetObject;
         private Vector3 _targetPosition;
+        private bool _hasLineOfSight;
 
         public override void Enter(AIState previous)
         {
@@ -44,7 +52,7 @@ namespace AI3.StateMachine
             _facingOverrideActive = false; // start out folling movement direction, like every other state
             _movementIntent = MovementIntent.None;
             _repositionTimer = 0f;
-            _nextSupressiveDecision = 0f;
+            _nextSuppressiveDecision = 0f;
             ResetPositionShotBudget();
             RefreshTarget();
 
@@ -56,19 +64,27 @@ namespace AI3.StateMachine
             RefreshTarget();
 
             if (_targetObject == null)
-                return; // shouldn't normally happen while Hostile, but nothing to fight if it does
+            {
+                StopMovement(false);
+                SetFacingOverride(false);
+                return;
+            }
 
             if (!(Core.AIEquipManager.CurrentWeapon is Gun gun))
+            {
+                StopMovement(false);
+                SetFacingOverride(false);
                 return; // melee/no-weapon combat not implemented yet
+            }
 
             float distance = HorizontalDistance(Core.transform.position, _targetPosition);
             Zone zone = ClassifyZone(gun.info, distance);
 
-            bool isRelocating = HandleMovement(zone, gun.info);
-            if (!isRelocating)
+            HandleMovement(zone, gun.info);
+            if (!_hasLineOfSight)
                 FaceTarget();
 
-            HandleFiring(zone, gun, isRelocating);
+            HandleFiring(zone, gun);
         }
 
         public override void Exit(AIState next)
@@ -103,12 +119,7 @@ namespace AI3.StateMachine
             AIAwareness awareness = Core.AISenses.GetHighAwareness(AISenses.AISensesGetHighFlags.Alerting);
             _targetObject = awareness?.targetObject;
             _targetPosition = awareness != null ? awareness.lastPos : Core.transform.position;
-        }
-
-        private bool HasLineOfSight()
-        {
-            AIAwareness awareness = Core.AISenses.GetHighAwareness(AISenses.AISensesGetHighFlags.Alerting);
-            return awareness != null && awareness.flags.HasFlag(AIAwarenessFlags.HaveLOS);
+            _hasLineOfSight = awareness != null && awareness.flags.HasFlag(AIAwarenessFlags.HaveLOS);
         }
 
         /// <summary>Distance in the XZ plane only -- see the earlier fix note: a vertical offset between
@@ -128,7 +139,11 @@ namespace AI3.StateMachine
             if (flatDirection.sqrMagnitude < 0.0001f)
                 return;
 
-            Core.transform.rotation = Quaternion.LookRotation(flatDirection.normalized);
+            Quaternion targetRotation = Quaternion.LookRotation(flatDirection.normalized);
+            Core.transform.rotation = Quaternion.RotateTowards(
+                Core.transform.rotation,
+                targetRotation,
+                COMBAT_TURN_SPEED * Time.deltaTime);
         }
 
         private Zone ClassifyZone(WeaponInfo info, float distance)
@@ -147,14 +162,17 @@ namespace AI3.StateMachine
 
             _repositionTimer -= Time.deltaTime;
 
-            
-            // Range is evaluated before an existing path is allowed to continue. Approach, retreat, and pursuit are goals, not uninterruptible animations:
-            // as soon as the live target position putsus in a different band, the obsolete path must be replaced or stopped.
-            if (!HasLineOfSight())
+
+            // Pursuit has no visible target to face, so NMA owns rotation. All visible-target combat movement
+            // keeps the body target-facing and lets AIAnimator's MoveX/MoveY blend tree represent
+            // forward, lateral, and backward path velocity in local space
+            SetFacingOverride(_hasLineOfSight);
+
+            if (!_hasLineOfSight)
             {
                 CancelMovementExcept(MovementIntent.PursueLastKnown);
 
-                if (_movementIntent != MovementIntent.PursueLastKnown || _repositionTimer <= 0f)
+                if (ShouldReplan(MovementIntent.PursueLastKnown))
                 {
                     BeginApproach(0f, MovementIntent.PursueLastKnown);
                     _repositionTimer = REPOSITION_INTERVAL;
@@ -167,7 +185,7 @@ namespace AI3.StateMachine
                 case Zone.BelowMinimum:
                 case Zone.DeadZoneNear:
                     CancelMovementExcept(MovementIntent.RetreatToRange);
-                    if (_movementIntent != MovementIntent.RetreatToRange || _repositionTimer <= 0f)
+                    if (ShouldReplan(MovementIntent.RetreatToRange))
                     {
                         FindFiringPosition(info, true);
                         _repositionTimer = REPOSITION_INTERVAL;
@@ -175,7 +193,7 @@ namespace AI3.StateMachine
                     return ContinueMovement(MovementIntent.RetreatToRange);
 
                 case Zone.Preferred:
-                    // The transform-to-target distaince is authoritative. NavMeshAgent.remaninigDistance
+                    // The transform-to-target distance is authoritative. NavMeshAgent.remaninigDistance
                     // can lag when updatePosition is false and root motion drives the actual transform.
                     float liveDistance = HorizontalDistance(Core.transform.position, _targetPosition);
                     float innerPreferred = Mathf.Min(
@@ -187,10 +205,18 @@ namespace AI3.StateMachine
 
                     // Continue just inside the band before stopping. Without this hysteresis, animation
                     // coast or a moving target can alternate adjacent frames across a range boundary.
-                    if (_movementIntent == MovementIntent.ApproachRange && liveDistance > outerPreferred)
-                        return ContinueMovement(MovementIntent.ApproachRange);
-                    if (_movementIntent == MovementIntent.RetreatToRange && liveDistance < innerPreferred)
-                        return ContinueMovement(MovementIntent.RetreatToRange);
+                    if (_movementIntent == MovementIntent.ApproachRange)
+                    {
+                        if (liveDistance > outerPreferred)
+                            return ContinueMovement(MovementIntent.ApproachRange);
+                        StopMovement(true);
+                    }
+                    else if (_movementIntent == MovementIntent.RetreatToRange)
+                    {
+                        if (liveDistance < innerPreferred)
+                            return ContinueMovement(MovementIntent.RetreatToRange);
+                        StopMovement(true);
+                    }
 
                     CancelMovementExcept(MovementIntent.LateralReposition);
                     if (_movementIntent == MovementIntent.LateralReposition)
@@ -209,7 +235,7 @@ namespace AI3.StateMachine
                 case Zone.DeadZoneFar:
                 case Zone.BeyondMaximum:
                     CancelMovementExcept(MovementIntent.ApproachRange);
-                    if (_movementIntent != MovementIntent.ApproachRange || _repositionTimer <= 0f)
+                    if (ShouldReplan(MovementIntent.ApproachRange))
                     {
                         BeginApproach(info.preferredRangeMax, MovementIntent.ApproachRange);
                         _repositionTimer = REPOSITION_INTERVAL;
@@ -230,6 +256,16 @@ namespace AI3.StateMachine
                 return;
 
             StopMovement(false);
+            _repositionTimer = 0f;
+        }
+
+        private bool ShouldReplan(MovementIntent desiredIntent)
+        {
+            if (_repositionTimer > 0f)
+                return false;
+
+            return _movementIntent != desiredIntent ||
+                HorizontalDistance(_targetPosition, _targetPositionAtPlan) >= TARGET_REPLAN_DISTANCE;
         }
 
         private bool ContinueMovement(MovementIntent expectedIntent)
@@ -243,13 +279,12 @@ namespace AI3.StateMachine
                 return false;
             }
 
-            SetFacingOverride(false);
+            SetFacingOverride(expectedIntent != MovementIntent.PursueLastKnown);
             return true;
         }
 
-        /// <summary>Toggles NavMeshAgent.updateRotation to match: manual facing (FaceTarget) only while
-        /// stationary, agent-driven facing (matches movement direction) any time we're relocating --
-        /// see the class-level note on why this matters for root-motion-driven movement.</summary>
+        /// <summary>When active, combat code owns body rot so the target remains forward while
+        /// AIAnimator converts the agent's path velocity into local directional blend params</summary>
         private void SetFacingOverride(bool active)
         {
             if (_facingOverrideActive == active || Core.NavMeshAgent == null)
@@ -268,12 +303,13 @@ namespace AI3.StateMachine
         /// <param name="intent"></param>
         private void BeginApproach(float targetDistance, MovementIntent intent)
         {
-            SetFacingOverride(false);
+            SetFacingOverride(intent != MovementIntent.PursueLastKnown);
             Core.NavMeshAgent.stoppingDistance = Mathf.Max(0f, targetDistance - RANGE_INSIDE_MARGIN);
             Vector3 nextDestination = _targetPosition;
             if (Core.NavMeshAgent.SetDestination(nextDestination))
             {
                 _moveDestination = nextDestination;
+                _targetPositionAtPlan = _targetPosition;
                 _movementIntent = intent;
             }
             else if (_movementIntent != intent)
@@ -283,9 +319,8 @@ namespace AI3.StateMachine
         }
 
         /// <summary>
-        /// Try radial, lateral, and fallback moves around its target. A near retreat first tries directly awawy;
-        /// a normal re-eval starts laterally. Only complete paths are accepted. SamplePosition alone does not
-        /// prove the AI can reach the point.
+        /// Tries short radial, lateral, and fallback moves around the target.
+        /// Each move is capped to roughly 0.6 seconds of travel
         /// </summary>
         /// <param name="info"></param>
         /// <param name="retreat"></param>
@@ -310,6 +345,12 @@ namespace AI3.StateMachine
                 float angle = retreat && i == 0 ? 0f : side * magnitude * POSITION_ANGLE_STEP;
                 Vector3 candidateDir = Quaternion.Euler(0f, angle, 0f) * radial;
                 Vector3 candidate = flatTarget + candidateDir * desiredRange;
+
+                float maxMoveDistance = Mathf.Max(Core.NavMeshAgent.radius * 2f, Core.NavMeshAgent.speed * TACTICAL_MOVE_DURATION);
+                Vector3 moveOffset = Flatten(candidate - flatSelf);
+                if (moveOffset.magnitude > maxMoveDistance)
+                    candidate = flatSelf + moveOffset.normalized * maxMoveDistance;
+
                 candidate.y = Core.transform.position.y;
 
                 if (Vector3.SqrMagnitude(Flatten(candidate - Core.transform.position)) < 1f)
@@ -336,12 +377,13 @@ namespace AI3.StateMachine
                 _candidatePath.status != NavMeshPathStatus.PathComplete)
                 return false;
 
-            SetFacingOverride(false);
+            SetFacingOverride(intent != MovementIntent.PursueLastKnown);
             Core.NavMeshAgent.stoppingDistance = 0.15f;
             if (!Core.NavMeshAgent.SetPath(_candidatePath))
                 return false;
 
             _moveDestination = destination;
+            _targetPositionAtPlan = _targetPosition;
             _movementIntent = intent;
             return true;
         }
@@ -385,9 +427,9 @@ namespace AI3.StateMachine
                 MAX_SHOTS_BEFORE_REPOSITION + 1);
         }
 
-        private void HandleFiring(Zone zone, Gun gun, bool isRelocating)
+        private void HandleFiring(Zone zone, Gun gun)
         {
-            if (isRelocating || !HasLineOfSight())
+            if (!_hasLineOfSight || !IsFacingTarget())
                 return;
 
             if (zone == Zone.BelowMinimum)
@@ -398,10 +440,10 @@ namespace AI3.StateMachine
 
             if (zone == Zone.BeyondMaximum)
             {
-                if (Time.time < _nextSupressiveDecision)
+                if (Time.time < _nextSuppressiveDecision)
                     return;
 
-                _nextSupressiveDecision = Time.time + SUPPRESSIVE_DECISION_INTERVAL;
+                _nextSuppressiveDecision = Time.time + SUPPRESSIVE_DECISION_INTERVAL;
                 if (Random.value > SUPPRESSIVE_FIRE_CHANCE)
                     return;
             }
@@ -410,6 +452,15 @@ namespace AI3.StateMachine
             _shotsFromCurrentPosition++;
             if (_shotsFromCurrentPosition >= _shotsBeforeReposition)
                 _repositionTimer = 0f;
+        }
+
+        private bool IsFacingTarget()
+        {
+            Vector3 flatDirection = Flatten(_targetPosition - Core.transform.position);
+            if (flatDirection.sqrMagnitude < 0.0001f)
+                return true;
+
+            return Vector3.Angle(Core.transform.forward, flatDirection) <= FIRE_ALIGNMENT_ANGLE;
         }
     }
 }
